@@ -25,7 +25,7 @@ August 1, 2023 – May 31, 2026
 Top-10 crypto assets by market cap as of June 1, 2026, excluding exchange tokens and stablecoins:
 BTC, ETH, XRP, SOL, LINK, DOGE, ADA, XLM, ZEC, HYPE.
 
-> **Note:** HYPE (Hyperliquid) has no yfinance ticker and appears only in Figure 1 (volume/market cap from CoinGecko).
+> **Note:** HYPE (Hyperliquid) is available on Yahoo Finance as `HYPE32196-USD`. Since no EUR pair exists, prices and volumes are converted to EUR using the EUR/USD exchange rate (`EURUSD=X`).
 
 ## How to Run
 

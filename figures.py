@@ -34,7 +34,7 @@ EXT_END     = "2026-05-31"
 
 # ── asset universes ───────────────────────────────────────────────────────────
 # Top-10 non-exchange crypto assets by market cap as of June 1, 2026
-# yfinance EUR tickers; HYPE has no yfinance listing so it appears only in Fig 1
+# EUR-denominated yfinance tickers
 CRYPTO_TICKERS = {
     "BTC-EUR":  "BTC",
     "ETH-EUR":  "ETH",
@@ -46,7 +46,9 @@ CRYPTO_TICKERS = {
     "XLM-EUR":  "XLM",
     "ZEC-EUR":  "ZEC",
 }
-# HYPE (Hyperliquid) has no yfinance EUR ticker; handled via CoinGecko only
+# HYPE (Hyperliquid) — only available as USD pair on yfinance; converted to EUR
+HYPE_TICKER = "HYPE32196-USD"
+EURUSD_TICKER = "EURUSD=X"
 CRYPTO_FOOTNOTE = ("Top-10 crypto assets by market capitalization as of June 1, 2026,"
                    " excluding exchange tokens and stablecoins.")
 
@@ -74,14 +76,9 @@ INDEX_TICKER = "EXS1.DE"   # iShares Core EURO STOXX 50 ETF
 # DATA HELPERS  (disk cache: prices → parquet, snapshots → json with 24h TTL)
 # ─────────────────────────────────────────────────────────────────────────────
 
-import os as _os, json as _json, hashlib as _hashlib, time as _time
+import os as _os, json as _json, time as _time
 _CACHE_DIR = "./cache"
 _os.makedirs(_CACHE_DIR, exist_ok=True)
-
-def _cache_path(tickers, start, end, tag="prices"):
-    key = "_".join(sorted(tickers)) + f"_{start}_{end}_{tag}"
-    h = _hashlib.md5(key.encode()).hexdigest()[:10]
-    return f"{_CACHE_DIR}/{h}.parquet"
 
 def _json_cache_load(path, ttl_hours=24):
     """Load JSON cache if it exists and is fresher than ttl_hours."""
@@ -96,22 +93,40 @@ def _json_cache_save(path, data):
     with open(path, "w") as f:
         _json.dump(data, f)
 
+# Fixed cache file names (one universe, one period)
+_STOXX_OHLC   = f"{_CACHE_DIR}/stoxx50_ohlc.parquet"
+_CRYPTO_OHLC  = f"{_CACHE_DIR}/crypto_ohlc.parquet"
+_HYPE_OHLC    = f"{_CACHE_DIR}/hype_ohlc.parquet"
+_EURUSD       = f"{_CACHE_DIR}/eurusd_prices.parquet"
+_INDEX_PRICES = f"{_CACHE_DIR}/eurostoxx50_etf_prices.parquet"
+_STOXX_MC     = f"{_CACHE_DIR}/stoxx50_market_caps.json"
+_COINGECKO    = f"{_CACHE_DIR}/coingecko_eur.json"
+
+def _is_crypto(tickers):
+    return any(t.endswith("-EUR") for t in tickers)
+
+def _is_index(tickers):
+    return list(tickers) == [INDEX_TICKER]
+
 def fetch_prices(tickers, start, end):
-    path = _cache_path(tickers, start, end, "prices")
-    if _os.path.exists(path):
-        return pd.read_parquet(path)
-    raw = yf.download(list(tickers), start=start, end=end,
-                      auto_adjust=True, progress=False, threads=True)
-    if isinstance(raw.columns, pd.MultiIndex):
-        result = raw["Close"].dropna(how="all")
-    else:
-        result = raw[["Close"]].dropna(how="all")
-    result.to_parquet(path)
-    return result
+    """Return Close prices. For STOXX 50 and crypto, extracted from OHLC cache."""
+    if _is_index(tickers):
+        path = _INDEX_PRICES
+        if _os.path.exists(path):
+            return pd.read_parquet(path)
+        raw = yf.download(list(tickers), start=start, end=end,
+                          auto_adjust=True, progress=False, threads=True)
+        result = (raw["Close"] if isinstance(raw.columns, pd.MultiIndex)
+                  else raw[["Close"]]).dropna(how="all")
+        result.to_parquet(path)
+        return result
+    # For STOXX 50 / crypto: extract Close from OHLC file (avoids duplicate download)
+    ohlc = fetch_ohlc(tickers, start, end)
+    return ohlc.get("Close", pd.DataFrame())
 
 
 def fetch_ohlc(tickers, start, end):
-    path = _cache_path(tickers, start, end, "ohlc")
+    path = _CRYPTO_OHLC if _is_crypto(tickers) else _STOXX_OHLC
     if _os.path.exists(path):
         stored = pd.read_parquet(path)
         return {col: stored[col] for col in stored.columns.get_level_values(0).unique()}
@@ -130,13 +145,54 @@ def fetch_ohlc(tickers, start, end):
     return result
 
 
+def fetch_hype_eur(start, end):
+    """Return OHLC dict for HYPE with all prices and volume converted to EUR.
+    HYPE32196-USD: Close/High/Low/Open in USD; Volume in USD.
+    Both are divided by EURUSD to produce EUR-denominated series.
+    """
+    # Load or download HYPE OHLC (USD)
+    if _os.path.exists(_HYPE_OHLC):
+        stored = pd.read_parquet(_HYPE_OHLC)
+        hype_raw = {col: stored[col] for col in stored.columns.get_level_values(0).unique()}
+    else:
+        raw = yf.download(HYPE_TICKER, start=start, end=end,
+                          auto_adjust=True, progress=False, threads=False)
+        if raw.empty:
+            return {}
+        available = raw.columns.get_level_values(0).unique() if isinstance(raw.columns, pd.MultiIndex) else raw.columns
+        hype_raw = {col: raw[col] if isinstance(raw.columns, pd.MultiIndex) else raw[[col]]
+                    for col in ["High","Low","Close","Volume"] if col in available}
+        pd.concat(hype_raw.values(), axis=1, keys=hype_raw.keys()).to_parquet(_HYPE_OHLC)
+
+    # Load or download EUR/USD
+    if _os.path.exists(_EURUSD):
+        fx = pd.read_parquet(_EURUSD)
+    else:
+        raw_fx = yf.download(EURUSD_TICKER, start=start, end=end,
+                             auto_adjust=True, progress=False, threads=False)
+        fx = (raw_fx["Close"] if isinstance(raw_fx.columns, pd.MultiIndex) else raw_fx[["Close"]]).dropna(how="all")
+        fx.to_parquet(_EURUSD)
+
+    # Align EURUSD to HYPE dates and forward-fill gaps
+    if isinstance(fx.columns, pd.MultiIndex):
+        eurusd = fx[EURUSD_TICKER]
+    else:
+        eurusd = fx.iloc[:, 0]
+
+    result = {}
+    for col, df in hype_raw.items():
+        series = df[HYPE_TICKER] if isinstance(df, pd.DataFrame) else df
+        series = series.dropna()
+        fx_aligned = eurusd.reindex(series.index).ffill().bfill()
+        result[col] = (series / fx_aligned).rename("HYPE")
+    return result
+
+
 def get_market_cap_eur(tickers_dict):
     """Return {label: market_cap_EUR} using today's yfinance fast_info.market_cap.
     Cached to disk for 24 hours. LSE tickers (.L) are in GBX; divide by 100.
     """
-    cache_key = "_".join(sorted(tickers_dict.keys()))
-    h = _hashlib.md5(cache_key.encode()).hexdigest()[:10]
-    path = f"{_CACHE_DIR}/mc_{h}.json"
+    path = _STOXX_MC
     cached = _json_cache_load(path)
     if cached:
         return cached
@@ -193,7 +249,7 @@ COINGECKO_ID_MAP = {
 
 def coingecko_eur():
     """Return DataFrame [label, market_cap, total_volume] in EUR. Cached 24h."""
-    path = f"{_CACHE_DIR}/coingecko_eur.json"
+    path = _COINGECKO
     cached = _json_cache_load(path)
     if cached:
         return pd.DataFrame(cached)
@@ -283,6 +339,7 @@ def make_figure2(label_suffix, start, end, period_note):
 
     stoxx_ohlc  = fetch_ohlc(stoxx_tickers,  start, end)
     crypto_ohlc = fetch_ohlc(crypto_tickers, start, end)
+    hype_ohlc   = fetch_hype_eur(start, end)
     stoxx_mc    = get_market_cap_eur(STOXX50_TICKERS)
     cg          = coingecko_eur()
     cg_mc       = dict(zip(cg["label"], cg["market_cap"])) if cg is not None else {}
@@ -327,6 +384,15 @@ def make_figure2(label_suffix, start, end, period_note):
             ax.annotate(label, (cg_mc[label], val), fontsize=8, color=CRYPTO_COLOR,
                         xytext=(4, 3), textcoords="offset points")
 
+    # HYPE (USD pair, converted to EUR)
+    if hype_ohlc and "HYPE" in cg_mc:
+        val = amihud(hype_ohlc.get("Close", pd.Series(dtype=float)),
+                     hype_ohlc.get("Volume", pd.Series(dtype=float)), vol_in_eur=True)
+        if val and np.isfinite(val) and val > 0:
+            ax.scatter(cg_mc["HYPE"], val, color=CRYPTO_COLOR, s=60, zorder=5)
+            ax.annotate("HYPE", (cg_mc["HYPE"], val), fontsize=8, color=CRYPTO_COLOR,
+                        xytext=(4, 3), textcoords="offset points")
+
     ax.set_xscale("log"); ax.set_yscale("log")
     ax.set_xlabel("Market Cap (Euro)", fontsize=11)
     ax.set_ylabel("Amihud Illiquidity Ratio (|ret| / EUR volume)", fontsize=11)
@@ -356,6 +422,7 @@ def make_figure3(label_suffix, start, end, period_note):
 
     stoxx_p  = fetch_prices(stoxx_tickers,  start, end)
     crypto_p = fetch_prices(crypto_tickers, start, end)
+    hype_ohlc = fetch_hype_eur(start, end)
     stoxx_mc = get_market_cap_eur(STOXX50_TICKERS)
 
     # CoinGecko for crypto market cap in EUR
@@ -391,6 +458,15 @@ def make_figure3(label_suffix, start, end, period_note):
         ax.annotate(label, (cg_mc[label], daily_vol), fontsize=8, color=CRYPTO_COLOR,
                     xytext=(4, 3), textcoords="offset points")
 
+    # HYPE
+    if hype_ohlc and "HYPE" in cg_mc:
+        hype_close = hype_ohlc.get("Close", pd.Series(dtype=float))
+        ret = hype_close.pct_change().dropna()
+        if len(ret) >= 20:
+            ax.scatter(cg_mc["HYPE"], ret.std(), color=CRYPTO_COLOR, s=60, zorder=5)
+            ax.annotate("HYPE", (cg_mc["HYPE"], ret.std()), fontsize=8, color=CRYPTO_COLOR,
+                        xytext=(4, 3), textcoords="offset points")
+
     ax.set_xscale("log")
     ax.set_ylim(bottom=0)
     ax.set_xlabel("Market Cap (Euro)", fontsize=11)
@@ -419,10 +495,11 @@ def make_figure4(label_suffix, start, end, period_note):
     stoxx_tickers  = list(STOXX50_TICKERS.keys())
     crypto_tickers = list(CRYPTO_TICKERS.keys())
 
-    stoxx_p  = fetch_prices(stoxx_tickers,  start, end)
-    crypto_p = fetch_prices(crypto_tickers, start, end)
-    index_p  = fetch_prices([INDEX_TICKER], start, end)
-    stoxx_mc = get_market_cap_eur(STOXX50_TICKERS)
+    stoxx_p   = fetch_prices(stoxx_tickers,  start, end)
+    crypto_p  = fetch_prices(crypto_tickers, start, end)
+    hype_ohlc = fetch_hype_eur(start, end)
+    index_p   = fetch_prices([INDEX_TICKER], start, end)
+    stoxx_mc  = get_market_cap_eur(STOXX50_TICKERS)
 
     if INDEX_TICKER not in index_p.columns:
         print(f"    Index {INDEX_TICKER} unavailable — skipping."); return
@@ -460,6 +537,18 @@ def make_figure4(label_suffix, start, end, period_note):
             ax.scatter(mc, corr, color=CRYPTO_COLOR, s=60, zorder=5)
             ax.annotate(label, (mc, corr), fontsize=8, color=CRYPTO_COLOR,
                         xytext=(4, 3), textcoords="offset points")
+
+    # HYPE
+    if hype_ohlc and "HYPE" in cg_mc:
+        hype_close = hype_ohlc.get("Close", pd.Series(dtype=float))
+        ret = hype_close.pct_change().dropna()
+        common = ret.index.intersection(idx_ret.index)
+        if len(common) >= 30:
+            corr = ret.loc[common].corr(idx_ret.loc[common])
+            if pd.notna(corr):
+                ax.scatter(cg_mc["HYPE"], corr, color=CRYPTO_COLOR, s=60, zorder=5)
+                ax.annotate("HYPE", (cg_mc["HYPE"], corr), fontsize=8, color=CRYPTO_COLOR,
+                            xytext=(4, 3), textcoords="offset points")
 
     ax.set_xscale("log")
     ax.set_xlabel("Market Cap (Euro)", fontsize=11)
